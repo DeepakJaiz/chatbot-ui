@@ -1,0 +1,216 @@
+name: CI/CD Pipeline
+'on':
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+permissions:
+  contents: read
+env:
+  PYTHON_VERSION: '3.12'
+  IMAGE_TAG: ${{ github.sha }}
+  APP_NAME: my-app
+jobs:
+  validate-code:
+    name: 'Validate: Code Quality'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: ${{ runner.os }}-pip-
+    - name: Install dependencies
+      run: pip install black flake8 isort
+    - name: Lint and format check
+      run: |
+        black --check .
+        isort --check-only .
+        flake8 .
+  test-unit:
+    name: 'Test: Unit Tests'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - validate-code
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: ${{ runner.os }}-pip-
+    - name: Install dependencies
+      run: pip install pytest pytest-cov
+    - name: Run Pytest
+      run: pytest --cov=app --cov-report=xml --junitxml=reports/junit.xml
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: reports/junit.xml
+        if-no-files-found: warn
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: coverage.xml
+        if-no-files-found: warn
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ci-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  build-docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs:
+    - validate-code
+    - test-unit
+    if: github.event_name == 'push' && !contains(github.event.head_commit.message,
+      '[skip ci]')
+    permissions:
+      packages: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ env.IMAGE_TAG }}
+          ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@0.36.0
+      with:
+        image-ref: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ env.IMAGE_TAG }}
+        format: sarif
+        output: trivy-results.sarif
+        severity: CRITICAL,HIGH
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: trivy-results.sarif
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ci-artifacts
+        path: |
+          reports/**
+          dist/**
+        if-no-files-found: warn
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - build-docker
+    if: github.event_name == 'push' && !contains(github.event.head_commit.message,
+      '[skip ci]')
+    environment: production
+    steps:
+    - name: Deploy via SSH
+      id: deploy
+      uses: appleboy/ssh-action@v1.0.3
+      env:
+        GHCR_USER: ${{ github.repository_owner }}
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        IMAGE_PULL: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ env.IMAGE_TAG }}
+        CONTAINER_NAME: ${{ env.APP_NAME }}-new
+        OLD_CONTAINER_NAME: ${{ env.APP_NAME }}
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        port: '22'
+        envs: GHCR_USER,GHCR_TOKEN,IMAGE_PULL,CONTAINER_NAME,OLD_CONTAINER_NAME
+        script: |
+          echo "Logging in to GHCR..."
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+          echo "Pulling new image..."
+          docker pull "$IMAGE_PULL"
+
+          echo "Stopping old container if exists..."
+          docker stop "$OLD_CONTAINER_NAME" 2>/dev/null || true
+          docker rm "$OLD_CONTAINER_NAME" 2>/dev/null || true
+
+          echo "Stopping new container if exists..."
+          docker stop "$CONTAINER_NAME" 2>/dev/null || true
+          docker rm "$CONTAINER_NAME" 2>/dev/null || true
+
+          echo "Starting new container..."
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            -p 7777:8000 \
+            --health-cmd="curl -f http://localhost:8000/health || exit 1" \
+            --health-interval=10s \
+            --health-timeout=5s \
+            --health-retries=3 \
+            "$IMAGE_PULL"
+
+          echo "Performing health check..."
+          HEALTH_CHECK_SUCCESS=false
+          for i in {1..10}; do
+            echo "Health check attempt $i/10"
+            if docker exec "$CONTAINER_NAME" curl -f http://localhost:8000/health 2>/dev/null; then
+              echo "Application is healthy"
+              HEALTH_CHECK_SUCCESS=true
+              break
+            fi
+            echo "Application not ready. Retrying in 3 seconds..."
+            sleep 3
+          done
+
+          if [ "$HEALTH_CHECK_SUCCESS" = true ]; then
+            echo "Renaming new container to main..."
+            docker rename "$CONTAINER_NAME" "$OLD_CONTAINER_NAME"
+            echo "Deployment successful"
+          else
+            echo "Health check failed"
+            echo "Container logs:"
+            docker logs "$CONTAINER_NAME" 2>&1 || true
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$CONTAINER_NAME" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Cleaning up unused images..."
+          docker image prune -af
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
