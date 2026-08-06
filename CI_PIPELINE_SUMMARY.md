@@ -1,53 +1,53 @@
-## Pipeline Walkthrough for Developers
+# Developer's Guide to the CI/CD Pipeline
 
-### Overview
-This is a full CI/CD pipeline for a Next.js service that builds, tests, scans, and deploys a Dockerized application. Jobs run sequentially with dependencies to ensure quality at each stage.
+This pipeline ensures code quality and automated deployment for the Next.js service. It triggers on pushes or pull requests to the `main` branch.
 
-### Stage 1: Code Quality (`validate-code`)
-**Purpose**: Enforce coding standards before any testing or building.
-- Runs ESLint for code quality checks
-- Verifies Prettier formatting consistency
-- Performs TypeScript type checking
-- Uses Node.js 20 with npm caching for faster installs
+## Overview
+- **Triggers**: Changes to `main` branch.
+- **Environments**: Uses the `production` environment for deployment approval.
+- **Concurrency**: Cancels in-progress workflows if a new one is triggered.
 
-### Stage 2: Unit Tests (`test-unit`)
-**Purpose**: Validate business logic and catch regressions.
-- Runs Jest tests with coverage reporting
-- Uploads test reports and build artifacts (`dist/`) as GitHub artifacts
-- Runs only after code quality passes
+## Jobs Breakdown
 
-### Stage 3: Build & Security (`build-package`)
-**Purpose**: Create deployable artifacts and validate security.
-- Builds the Next.js production bundle
-- Builds a Docker image using GitHub Actions cache
-- **Security scan**: Uses Trivy to check for critical/high vulnerabilities in the image
-- **Conditional push**: Only pushes the image to GHCR on main branch pushes
-- Tags images with both commit SHA and `latest`
+### 1. Source Test Job
+- **Purpose**: Catch code errors early.
+- **Steps**: 
+  - Checkout code and setup Node.js (v20).
+  - Install dependencies with `npm ci`.
+  - Run linting (`npm run lint`) and tests (`npm test`).
+  - Upload test reports and build artifacts.
+- **Why**: Validates code before building and deploying.
 
-### Stage 4: Production Deploy (`deploy-ec2`)
-**Purpose**: Deploy to production with safety checks.
-- **Condition**: Only runs on pushes to `main` (not PRs)
-- **Environment**: Uses `production` environment for approval gates
-- **Concurrency**: Uses `deploy-production` group to prevent parallel deployments
-- **Deployment process**:
-  1. Logs into GHCR with GitHub token
-  2. Pulls the new Docker image
-  3. Stops and removes existing container
-  4. Starts new container with environment variables and resource limits (512MB RAM, 1 CPU)
-  5. Runs health checks (10 attempts, 3s delay)
-  6. **Automatic rollback**: If health checks fail, stops container and exits with error
+### 2. Package Build Job
+- **Purpose**: Create and secure the Docker image.
+- **Depends on**: Source Test job.
+- **Steps**: 
+  - Build the Next.js app (`npm run build`).
+  - Setup Docker and login to GHCR (GitHub Container Registry).
+  - Build and push Docker image tagged with commit SHA and `latest`.
+  - Scan image with Trivy for HIGH/CRITICAL vulnerabilities.
+  - Upload build artifacts.
+- **Why**: Ensures application is packaged and scanned for security issues.
 
-### Workflow Concurrency
-- Uses `group: workflow-ref` to cancel in-progress runs for the same branch
-- Prevents redundant deployments when multiple pushes happen quickly
+### 3. Deploy Production Job
+- **Purpose**: Deploy to production with zero downtime.
+- **Depends on**: Package Build job.
+- **Steps**: 
+  - Checkout code for SSH setup.
+  - Connect to EC2 host via SSH and pull the new Docker image.
+  - Run a new container with environment variables (e.g., Supabase keys).
+  - Perform health checks to verify application status.
+  - Replace the old container with the new one.
+  - Clean up unused Docker images.
+- **Why**: Automates deployment while minimizing downtime.
 
-### Key Connections
-1. `validate-code` → `test-unit` → `build-package` (sequential dependency)
-2. `build-package` → `deploy-ec2` (only for main branch pushes)
-3. Artifacts flow: Test reports → Build artifacts → Docker image → EC2 deployment
+## Flow and Connections
+- Jobs run sequentially: Source Test → Package Build → Deploy Production.
+- Each job depends on the previous one, ensuring quality gates are met.
 
-### Local Development Notes
-- Run `npm run lint`, `npm run format:check`, and `npm run type-check` to validate locally
-- Tests: `npm test -- --coverage --ci`
-- Build: `npm run build`
-- Docker: Image is built with multi-stage caching via GitHub Actions cache
+## Tips for Developers
+- Run tests locally before pushing to avoid pipeline failures.
+- Monitor security scans and fix vulnerabilities promptly.
+- For deployment issues, verify EC2 host access and secret configurations.
+
+This pipeline streamlines development and deployment for the Next.js service.
